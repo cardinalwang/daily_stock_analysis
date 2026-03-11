@@ -39,6 +39,7 @@ STOCK_NAME_MAP = {
     'AMZN': '亞馬遜', 'NVDA': '輝達', 'META': 'Meta', 'AMD': 'AMD', 'INTC': '英特爾',
     'BABA': '阿里巴巴', 'PDD': '拼多多', 'JD': '京東', 'BIDU': '百度', 'NIO': '蔚來',
     'XPEV': '小鵬汽車', 'LI': '理想汽車', 'COIN': 'Coinbase', 'MSTR': '微策略',
+    'QQQ': '納斯達克100ETF', 'DIA': '道瓊工業ETF', 'SPY': '標普500ETF',
 
     # === 港股 ===
     '00700': '騰訊控股', '03690': '美團', '01810': '小米集團', '09988': '阿里巴巴',
@@ -182,7 +183,7 @@ class AnalysisResult:
 class GeminiAnalyzer:
     """Gemini AI 分析器"""
 
-    # 遵循原邏輯，僅進行繁體化與文字精煉
+    # 確保結尾的 """ 沒有被遺漏
     SYSTEM_PROMPT = """你是一位專注於趨勢交易的投資分析師，請生成繁體中文的【決策儀表板】報告。
 
 ## 核心交易理念
@@ -199,80 +200,4 @@ class GeminiAnalyzer:
 
 ### 3. 效率優先（籌碼結構）
 - 90%籌碼集中度 < 15% 為集中
-- 70-90% 獲利盤需警惕回吐
-- 現價高於平均成本 5-15% 為健康
-
-### 4. 買點偏好
-- 最佳：縮量回踩 MA5 支撐
-- 次優：回踩 MA10 支撐
-- 跌破 MA20 則觀望
-
-### 5. 評分標準
-- 買入(60-100)：多頭排列，乖離率<5%，量能配合，無利空。
-- 觀望(40-59)：乖離率>5%，均線纏繞，或有風險事件。
-- 賣出(0-39)：空頭排列，跌破MA20，放量下跌或重大利空。
-
-## 輸出格式（嚴格遵守 JSON）
-```json
-{
-    "stock_name": "正確中文全稱",
-    "sentiment_score": 0-100,
-    "trend_prediction": "看多/震盪/看空",
-    "operation_advice": "買入/加倉/持有/減倉/賣出/觀望",
-    "decision_type": "buy/hold/sell",
-    "confidence_level": "高/中/低",
-    "dashboard": {
-        "core_conclusion": {
-            "one_sentence": "30字以內核心結論",
-            "signal_type": "🟢買入/🟡觀望/🔴賣出/⚠️風險",
-            "time_sensitivity": "立即/今日內/本週內/不急",
-            "position_advice": {
-                "no_position": "空倉者建議",
-                "has_position": "持倉者建議"
-            }
-        },
-        "data_perspective": {
-            "trend_status": {
-                "ma_alignment": "均線排列狀態描述",
-                "is_bullish": true/false
-            },
-            "price_position": {
-                "current_price": 數值,
-                "bias_ma5": 數值,
-                "bias_status": "安全/警戒/危險",
-                "support_level": 數值,
-                "resistance_level": 數值
-            },
-            "volume_analysis": {
-                "volume_status": "放量/縮量/平量",
-                "volume_meaning": "量能解讀"
-            },
-            "chip_structure": {
-                "profit_ratio": 數值,
-                "chip_health": "健康/一般/警惕"
-            }
-        },
-        "intelligence": {
-            "latest_news": "近期重要新聞摘要",
-            "risk_alerts": ["風險點1", "風險點2"],
-            "positive_catalysts": ["利好1", "利好2"]
-        },
-        "battle_plan": {
-            "sniper_points": {
-                "ideal_buy": "理想買入點",
-                "secondary_buy": "次優買入點",
-                "stop_loss": "止損位",
-                "take_profit": "目標位"
-            },
-            "position_strategy": {
-                "suggested_position": "建議倉位"
-            },
-            "action_checklist": [
-                "✅/⚠️/❌ 檢查項1",
-                "✅/⚠️/❌ 檢查項2"
-            ]
-        }
-    },
-    "analysis_summary": "100字綜合分析摘要",
-    "risk_warning": "風險提示"
-}
+- 70-90% 獲利
