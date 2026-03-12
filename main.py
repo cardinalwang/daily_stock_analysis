@@ -352,10 +352,10 @@ def run_full_analysis(
         if merge_notification and (results or market_report) and not args.no_notify:
             parts = []
             if market_report:
-                parts.append(f"# □蠥□□□□n\n{market_report}")
+                parts.append(f"# 大盤復盤\n{market_report}")
             if results:
                 dashboard_content = pipeline.notifier.generate_dashboard_report(results)
-                parts.append(f"# □□誨□泧□□□□n\n{dashboard_content}")
+                parts.append(f"# 個股決策儀表板\n{dashboard_content}")
             if parts:
                 combined_content = "\n\n---\n\n".join(parts)
                 if pipeline.notifier.is_available():
@@ -394,12 +394,12 @@ def run_full_analysis(
 
                 # 添加大盤復盤內容（如果有）
                 if market_report:
-                    full_content += f"# □蠥□□□□n\n{market_report}\n\n---\n\n"
+                    full_content += f"# 大盤復盤\n{market_report}\n\n---\n\n"
 
                 # 添加個股決策儀表盤（使用 NotificationService 生成）
                 if results:
                     dashboard_content = pipeline.notifier.generate_dashboard_report(results)
-                    full_content += f"# □□誨□泧□□□□n\n{dashboard_content}"
+                    full_content += 個股決策儀表板\n{dashboard_content}"
 
                 # 3. 創建文檔
                 doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
