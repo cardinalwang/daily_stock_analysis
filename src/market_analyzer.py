@@ -45,7 +45,6 @@ from typing import List, Optional, Tuple
 
 from data_provider.base import canonical_stock_code
 from src.core.pipeline import StockAnalysisPipeline
-from src.core.market_review import run_market_review
 from src.webui_frontend import prepare_webui_frontend_assets
 from src.config import get_config, Config
 from src.logging_config import setup_logging
