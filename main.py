@@ -399,7 +399,7 @@ def run_full_analysis(
                 # 添加個股決策儀表盤（使用 NotificationService 生成）
                 if results:
                     dashboard_content = pipeline.notifier.generate_dashboard_report(results)
-                    full_content += 個股決策儀表板\n{dashboard_content}"
+                    full_content += "個股決策儀表板\n{dashboard_content}"
 
                 # 3. 創建文檔
                 doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
