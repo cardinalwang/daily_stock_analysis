@@ -1,711 +1,721 @@
-
+# -*- coding: utf-8 -*-
 """
 ===================================
-A股自選股智能分析系統 - 主調度程序
+大盤復盤分析模組
 ===================================
 
 職責：
-1. 協調各模塊完成股票分析流程
-2. 實現低並發的線程池調度
-3. 全局異常處理，確保單股失敗不影響整體
-4. 提供命令行入口
-
-使用方式：
-    python main.py              # 正常運行
-    python main.py --debug      # 調試模式
-    python main.py --dry-run    # 僅獲取數據不分析
-
-交易理念（已融入分析）：
-- 嚴進策略：不追高，乖離率 > 5% 不買入
-- 趨勢交易：只做 MA5>MA10>MA20 多頭排列
-- 效率優先：關注籌碼集中度好的股票
-- 買點偏好：縮量回踩 MA5/MA10 支撐
+1. 獲取大盤指數數據（上證、深證、創業板）
+2. 搜索市場新聞形成復盤情報
+3. 使用大模型生成每日大盤復盤報告
 """
-import os
-from src.config import setup_env
-setup_env()
 
-# 代理配置 - 通過 USE_PROXY 環境變量控制，默認關閉
-# GitHub Actions 環境自動跳過代理配置
-if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").lower() == "true":
-    # 本地開發環境，啟用代理（可在 .env 中配置 PROXY_HOST 和 PROXY_PORT）
-    proxy_host = os.getenv("PROXY_HOST", "127.0.0.1")
-    proxy_port = os.getenv("PROXY_PORT", "10809")
-    proxy_url = f"http://{proxy_host}:{proxy_port}"
-    os.environ["http_proxy"] = proxy_url
-    os.environ["https_proxy"] = proxy_url
-
-import argparse
 import logging
-import sys
 import time
-import uuid
-from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, Dict, Any, List
 
-from data_provider.base import canonical_stock_code
-from src.core.pipeline import StockAnalysisPipeline
-from src.webui_frontend import prepare_webui_frontend_assets
-from src.config import get_config, Config
-from src.logging_config import setup_logging
+import pandas as pd
 
+from src.config import get_config
+from src.search_service import SearchService
+from src.core.market_profile import get_profile, MarketProfile
+from src.core.market_strategy import get_market_strategy_blueprint
+from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
 
 
-def parse_arguments() -> argparse.Namespace:
-    """解析命令行參數"""
-    parser = argparse.ArgumentParser(
-        description='A股自選股智能分析系統',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-示例:
-  python main.py                    # 正常運行
-  python main.py --debug            # 調試模式
-  python main.py --dry-run          # 僅獲取數據，不進行 AI 分析
-  python main.py --stocks 600519,000001  # 指定分析特定股票
-  python main.py --no-notify        # 不發送推送通知
-  python main.py --single-notify    # 啟用單股推送模式（每分析完一隻立即推送）
-  python main.py --schedule         # 啟用定時任務模式
-  python main.py --market-review    # 僅運行大盤復盤
-        '''
-    )
-
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='啟用調試模式，輸出詳細日誌'
-    )
-
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='僅獲取數據，不進行 AI 分析'
-    )
-
-    parser.add_argument(
-        '--stocks',
-        type=str,
-        help='指定要分析的股票代碼，逗號分隔（覆蓋配置文件）'
-    )
-
-    parser.add_argument(
-        '--no-notify',
-        action='store_true',
-        help='不發送推送通知'
-    )
-
-    parser.add_argument(
-        '--single-notify',
-        action='store_true',
-        help='啟用單股推送模式：每分析完一隻股票立即推送，而不是匯總推送'
-    )
-
-    parser.add_argument(
-        '--workers',
-        type=int,
-        default=None,
-        help='並發線程數（默認使用配置值）'
-    )
-
-    parser.add_argument(
-        '--schedule',
-        action='store_true',
-        help='啟用定時任務模式，每日定時執行'
-    )
-
-    parser.add_argument(
-        '--no-run-immediately',
-        action='store_true',
-        help='定時任務啟動時不立即執行一次'
-    )
-
-    parser.add_argument(
-        '--market-review',
-        action='store_true',
-        help='僅運行大盤復盤分析'
-    )
-
-    parser.add_argument(
-        '--no-market-review',
-        action='store_true',
-        help='跳過大盤復盤分析'
-    )
-
-    parser.add_argument(
-        '--force-run',
-        action='store_true',
-        help='跳過交易日檢查，強制執行全量分析（Issue #373）'
-    )
-
-    parser.add_argument(
-        '--webui',
-        action='store_true',
-        help='啟動 Web 管理界面'
-    )
-
-    parser.add_argument(
-        '--webui-only',
-        action='store_true',
-        help='僅啟動 Web 服務，不執行自動分析'
-    )
-
-    parser.add_argument(
-        '--serve',
-        action='store_true',
-        help='啟動 FastAPI 後端服務（同時執行分析任務）'
-    )
-
-    parser.add_argument(
-        '--serve-only',
-        action='store_true',
-        help='僅啟動 FastAPI 後端服務，不自動執行分析'
-    )
-
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=8000,
-        help='FastAPI 服務端口（默認 8000）'
-    )
-
-    parser.add_argument(
-        '--host',
-        type=str,
-        default='0.0.0.0',
-        help='FastAPI 服務監聽地址（默認 0.0.0.0）'
-    )
-
-    parser.add_argument(
-        '--no-context-snapshot',
-        action='store_true',
-        help='不保存分析上下文快照'
-    )
-
-    # === Backtest ===
-    parser.add_argument(
-        '--backtest',
-        action='store_true',
-        help='運行回測（對歷史分析結果進行評估）'
-    )
-
-    parser.add_argument(
-        '--backtest-code',
-        type=str,
-        default=None,
-        help='僅回測指定股票代碼'
-    )
-
-    parser.add_argument(
-        '--backtest-days',
-        type=int,
-        default=None,
-        help='回測評估窗口（交易日數，默認使用配置）'
-    )
-
-    parser.add_argument(
-        '--backtest-force',
-        action='store_true',
-        help='強制回測（即使已有回測結果也重新計算）'
-    )
-
-    return parser.parse_args()
-
-
-def _compute_trading_day_filter(
-    config: Config,
-    args: argparse.Namespace,
-    stock_codes: List[str],
-) -> Tuple[List[str], Optional[str], bool]:
-    """
-    Compute filtered stock list and effective market review region (Issue #373).
-
-    Returns:
-        (filtered_codes, effective_region, should_skip_all)
-        - effective_region None = use config default (check disabled)
-        - effective_region '' = all relevant markets closed, skip market review
-        - should_skip_all: skip entire run when no stocks and no market review to run
-    """
-    force_run = getattr(args, 'force_run', False)
-    if force_run or not getattr(config, 'trading_day_check_enabled', True):
-        return (stock_codes, None, False)
-
-    from src.core.trading_calendar import (
-        get_market_for_stock,
-        get_open_markets_today,
-        compute_effective_region,
-    )
-
-    open_markets = get_open_markets_today()
-    filtered_codes = []
-    for code in stock_codes:
-        mkt = get_market_for_stock(code)
-        if mkt in open_markets or mkt is None:
-            filtered_codes.append(code)
-
-    if config.market_review_enabled and not getattr(args, 'no_market_review', False):
-        effective_region = compute_effective_region(
-            getattr(config, 'market_review_region', 'cn') or 'cn', open_markets
-        )
-    else:
-        effective_region = None
-
-    should_skip_all = (not filtered_codes) and (effective_region or '') == ''
-    return (filtered_codes, effective_region, should_skip_all)
-
-
-def run_full_analysis(
-    config: Config,
-    args: argparse.Namespace,
-    stock_codes: Optional[List[str]] = None
-):
-    """
-    執行完整的分析流程（個股 + 大盤復盤）
-
-    這是定時任務調用的主函數
-    """
-    try:
-        # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
-        if stock_codes is None:
-            config.refresh_stock_list()
-
-        # Issue #373: Trading day filter (per-stock, per-market)
-        effective_codes = stock_codes if stock_codes is not None else config.stock_list
-        filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
-            config, args, effective_codes
-        )
-        if should_skip:
-            logger.info(
-                "今日所有相關市場均為非交易日，跳過執行。可使用 --force-run 強制執行。"
-            )
-            return
-        if set(filtered_codes) != set(effective_codes):
-            skipped = set(effective_codes) - set(filtered_codes)
-            logger.info("今日休市股票已跳過: %s", skipped)
-        stock_codes = filtered_codes
-
-        # 命令行參數 --single-notify 覆蓋配置（#55）
-        if getattr(args, 'single_notify', False):
-            config.single_stock_notify = True
-
-        # Issue #190: 個股與大盤復盤合併推送
-        merge_notification = (
-            getattr(config, 'merge_email_notification', False)
-            and config.market_review_enabled
-            and not getattr(args, 'no_market_review', False)
-            and not config.single_stock_notify
-        )
-
-        # 創建調度器
-        save_context_snapshot = None
-        if getattr(args, 'no_context_snapshot', False):
-            save_context_snapshot = False
-        query_id = uuid.uuid4().hex
-        pipeline = StockAnalysisPipeline(
-            config=config,
-            max_workers=args.workers,
-            query_id=query_id,
-            query_source="cli",
-            save_context_snapshot=save_context_snapshot
-        )
-
-        # 1. 運行個股分析
-        results = pipeline.run(
-            stock_codes=stock_codes,
-            dry_run=args.dry_run,
-            send_notification=not args.no_notify,
-            merge_notification=merge_notification
-        )
-
-        # Issue #128: 分析間隔 - 在個股分析和大盤分析之間添加延遲
-        analysis_delay = getattr(config, 'analysis_delay', 0)
-        if (
-            analysis_delay > 0
-            and config.market_review_enabled
-            and not args.no_market_review
-            and effective_region != ''
-        ):
-            logger.info(f"等待 {analysis_delay} 秒後執行大盤復盤（避免API限流）...")
-            time.sleep(analysis_delay)
-
-        # 2. 運行大盤復盤（如果啟用且不是僅個股模式）
-        market_report = ""
-        if (
-            config.market_review_enabled
-            and not args.no_market_review
-            and effective_region != ''
-        ):
-            review_result = run_market_review(
-                notifier=pipeline.notifier,
-                analyzer=pipeline.analyzer,
-                search_service=pipeline.search_service,
-                send_notification=not args.no_notify,
-                merge_notification=merge_notification,
-                override_region=effective_region,
-            )
-            # 如果有結果，賦值給 market_report 用於後續飛書文檔生成
-            if review_result:
-                market_report = review_result
-
-        # Issue #190: 合併推送（個股+大盤復盤）
-        if merge_notification and (results or market_report) and not args.no_notify:
-            parts = []
-            if market_report:
-                parts.append(f"# □蠥□□□□n\n{market_report}")
-            if results:
-                dashboard_content = pipeline.notifier.generate_dashboard_report(results)
-                parts.append(f"# □□誨□泧□□□□n\n{dashboard_content}")
-            if parts:
-                combined_content = "\n\n---\n\n".join(parts)
-                if pipeline.notifier.is_available():
-                    if pipeline.notifier.send(combined_content, email_send_to_all=True):
-                        logger.info("已合併推送（個股+大盤復盤）")
-                    else:
-                        logger.warning("合併推送失敗")
-
-        # 輸出摘要
-        if results:
-            logger.info("\n===== 分析結果摘要 =====")
-            for r in sorted(results, key=lambda x: x.sentiment_score, reverse=True):
-                emoji = r.get_emoji()
-                logger.info(
-                    f"{emoji} {r.name}({r.code}): {r.operation_advice} | "
-                    f"評分 {r.sentiment_score} | {r.trend_prediction}"
-                )
-
-        logger.info("\n任務執行完成")
-
-        # === 新增：生成飛書雲文檔 ===
-        try:
-            from src.feishu_doc import FeishuDocManager
-
-            feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
-                logger.info("正在創建飛書雲文檔...")
-
-                # 1. 準備標題 "01-01 13:01大盤復盤"
-                tz_cn = timezone(timedelta(hours=8))
-                now = datetime.now(tz_cn)
-                doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} 大盤復盤"
-
-                # 2. 準備內容 (拼接個股分析和大盤復盤)
-                full_content = ""
-
-                # 添加大盤復盤內容（如果有）
-                if market_report:
-                    full_content += f"# □蠥□□□□n\n{market_report}\n\n---\n\n"
-
-                # 添加個股決策儀表盤（使用 NotificationService 生成）
-                if results:
-                    dashboard_content = pipeline.notifier.generate_dashboard_report(results)
-                    full_content += f"# □□誨□泧□□□□n\n{dashboard_content}"
-
-                # 3. 創建文檔
-                doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
-                if doc_url:
-                    logger.info(f"飛書雲文檔創建成功: {doc_url}")
-                    # 可選：將文檔鏈接也推送到群裡
-                    if not args.no_notify:
-                        pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 復盤文檔創建成功: {doc_url}")
-
-        except Exception as e:
-            logger.error(f"飛書文檔生成失敗: {e}")
-
-        # === Auto backtest ===
-        try:
-            if getattr(config, 'backtest_enabled', False):
-                from src.services.backtest_service import BacktestService
-
-                logger.info("開始自動回測...")
-                service = BacktestService()
-                stats = service.run_backtest(
-                    force=False,
-                    eval_window_days=getattr(config, 'backtest_eval_window_days', 10),
-                    min_age_days=getattr(config, 'backtest_min_age_days', 14),
-                    limit=200,
-                )
-                logger.info(
-                    f"自動回測完成: processed={stats.get('processed')} saved={stats.get('saved')} "
-                    f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
-                )
-        except Exception as e:
-            logger.warning(f"自動回測失敗（已忽略）: {e}")
-
-    except Exception as e:
-        logger.exception(f"分析流程執行失敗: {e}")
-
-
-def start_api_server(host: str, port: int, config: Config) -> None:
-    """
-    在後台線程啟動 FastAPI 服務
+@dataclass
+class MarketIndex:
+    """大盤指數數據"""
+    code: str                    # 指數代碼
+    name: str                    # 指數名稱
+    current: float = 0.0         # 當前點位
+    change: float = 0.0          # 漲跌點數
+    change_pct: float = 0.0      # 漲跌幅(%)
+    open: float = 0.0            # 開盤點位
+    high: float = 0.0            # 最高點位
+    low: float = 0.0             # 最低點位
+    prev_close: float = 0.0      # 昨收點位
+    volume: float = 0.0          # 成交量（手）
+    amount: float = 0.0          # 成交額（元）
+    amplitude: float = 0.0       # 振幅(%)
     
-    Args:
-        host: 監聽地址
-        port: 監聽端口
-        config: 配置對像
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'name': self.name,
+            'current': self.current,
+            'change': self.change,
+            'change_pct': self.change_pct,
+            'open': self.open,
+            'high': self.high,
+            'low': self.low,
+            'volume': self.volume,
+            'amount': self.amount,
+            'amplitude': self.amplitude,
+        }
+
+
+@dataclass
+class MarketOverview:
+    """市場概覽數據"""
+    date: str                           # 日期
+    indices: List[MarketIndex] = field(default_factory=list)  # 主要指數
+    up_count: int = 0                   # 上漲家數
+    down_count: int = 0                 # 下跌家數
+    flat_count: int = 0                 # 平盤家數
+    limit_up_count: int = 0             # 漲停家數
+    limit_down_count: int = 0           # 跌停家數
+    total_amount: float = 0.0           # 兩市成交額（億元）
+    # north_flow: float = 0.0           # 北向資金淨流入（億元）- 已廢棄，接口不可用
+    
+    # 板塊漲幅榜
+    top_sectors: List[Dict] = field(default_factory=list)     # 漲幅前5板塊
+    bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板塊
+
+
+class MarketAnalyzer:
     """
-    import threading
-    import uvicorn
+    大盤復盤分析器
+    
+    功能：
+    1. 獲取大盤指數實時行情
+    2. 獲取市場漲跌統計
+    3. 獲取板塊漲跌榜
+    4. 搜索市場新聞
+    5. 生成大盤復盤報告
+    """
+    
+    def __init__(
+        self,
+        search_service: Optional[SearchService] = None,
+        analyzer=None,
+        region: str = "cn",
+    ):
+        """
+        初始化大盤分析器
 
-    def run_server():
-        level_name = (config.log_level or "INFO").lower()
-        uvicorn.run(
-            "api.app:app",
-            host=host,
-            port=port,
-            log_level=level_name,
-            log_config=None,
-        )
+        Args:
+            search_service: 搜索服務實例
+            analyzer: AI分析器實例（用於調用LLM）
+            region: 市場區域 cn=A股 us=美股
+        """
+        self.config = get_config()
+        self.search_service = search_service
+        self.analyzer = analyzer
+        self.data_manager = DataFetcherManager()
+        self.region = region if region in ("cn", "us") else "cn"
+        self.profile: MarketProfile = get_profile(self.region)
+        self.strategy = get_market_strategy_blueprint(self.region)
 
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
-    logger.info(f"FastAPI 服務已啟動: http://{host}:{port}")
+    def get_market_overview(self) -> MarketOverview:
+        """
+        獲取市場概覽數據
+        
+        Returns:
+            MarketOverview: 市場概覽數據對象
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        overview = MarketOverview(date=today)
+        
+        # 1. 獲取主要指數行情（按 region 切換 A 股/美股）
+        overview.indices = self._get_main_indices()
 
+        # 2. 獲取漲跌統計（A 股有，美股無等效數據）
+        if self.profile.has_market_stats:
+            self._get_market_statistics(overview)
 
-def _is_truthy_env(var_name: str, default: str = "true") -> bool:
-    """Parse common truthy / falsy environment values."""
-    value = os.getenv(var_name, default).strip().lower()
-    return value not in {"0", "false", "no", "off"}
+        # 3. 獲取板塊漲跌榜（A 股有，美股暫無）
+        if self.profile.has_sector_rankings:
+            self._get_sector_rankings(overview)
+        
+        # 4. 獲取北向資金（可選）
+        # self._get_north_flow(overview)
+        
+        return overview
 
-def start_bot_stream_clients(config: Config) -> None:
-    """Start bot stream clients when enabled in config."""
-    # 啟動釘釘 Stream 客戶端
-    if config.dingtalk_stream_enabled:
+    
+    def _get_main_indices(self) -> List[MarketIndex]:
+        """獲取主要指數實時行情"""
+        indices = []
+
         try:
-            from bot.platforms import start_dingtalk_stream_background, DINGTALK_STREAM_AVAILABLE
-            if DINGTALK_STREAM_AVAILABLE:
-                if start_dingtalk_stream_background():
-                    logger.info("[Main] Dingtalk Stream client started in background.")
-                else:
-                    logger.warning("[Main] Dingtalk Stream client failed to start.")
+            logger.info("[大盤] 獲取主要指數實時行情...")
+
+            # 使用 DataFetcherManager 獲取指數行情（按 region 切換）
+            data_list = self.data_manager.get_main_indices(region=self.region)
+
+            if data_list:
+                for item in data_list:
+                    index = MarketIndex(
+                        code=item['code'],
+                        name=item['name'],
+                        current=item['current'],
+                        change=item['change'],
+                        change_pct=item['change_pct'],
+                        open=item['open'],
+                        high=item['high'],
+                        low=item['low'],
+                        prev_close=item['prev_close'],
+                        volume=item['volume'],
+                        amount=item['amount'],
+                        amplitude=item['amplitude']
+                    )
+                    indices.append(index)
+
+            if not indices:
+                logger.warning("[大盤] 所有行情數據源失敗，將依賴新聞搜索進行分析")
             else:
-                logger.warning("[Main] Dingtalk Stream enabled but SDK is missing.")
-                logger.warning("[Main] Run: pip install dingtalk-stream")
-        except Exception as exc:
-            logger.error(f"[Main] Failed to start Dingtalk Stream client: {exc}")
+                logger.info(f"[大盤] 獲取到 {len(indices)} 個指數行情")
 
-    # 啟動飛書 Stream 客戶端
-    if getattr(config, 'feishu_stream_enabled', False):
-        try:
-            from bot.platforms import start_feishu_stream_background, FEISHU_SDK_AVAILABLE
-            if FEISHU_SDK_AVAILABLE:
-                if start_feishu_stream_background():
-                    logger.info("[Main] Feishu Stream client started in background.")
-                else:
-                    logger.warning("[Main] Feishu Stream client failed to start.")
-            else:
-                logger.warning("[Main] Feishu Stream enabled but SDK is missing.")
-                logger.warning("[Main] Run: pip install lark-oapi")
-        except Exception as exc:
-            logger.error(f"[Main] Failed to start Feishu Stream client: {exc}")
-
-
-def main() -> int:
-    """
-    主入口函數
-
-    Returns:
-        退出碼（0 表示成功）
-    """
-    # 解析命令行參數
-    args = parse_arguments()
-
-    # 加載配置（在設置日誌前加載，以獲取日誌目錄）
-    config = get_config()
-
-    # 配置日誌（輸出到控制台和文件）
-    setup_logging(log_prefix="stock_analysis", debug=args.debug, log_dir=config.log_dir)
-
-    logger.info("=" * 60)
-    logger.info("A股自選股智能分析系統 啟動")
-    logger.info(f"運行時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 60)
-
-    # 驗證配置
-    warnings = config.validate()
-    for warning in warnings:
-        logger.warning(warning)
-
-    # 解析股票列表（統一為大寫 Issue #355）
-    stock_codes = None
-    if args.stocks:
-        stock_codes = [canonical_stock_code(c) for c in args.stocks.split(',') if (c or "").strip()]
-        logger.info(f"使用命令行指定的股票列表: {stock_codes}")
-
-    # === 處理 --webui / --webui-only 參數，映射到 --serve / --serve-only ===
-    if args.webui:
-        args.serve = True
-    if args.webui_only:
-        args.serve_only = True
-
-    # 兼容舊版 WEBUI_ENABLED 環境變量
-    if config.webui_enabled and not (args.serve or args.serve_only):
-        args.serve = True
-
-    # === 啟動 Web 服務 (如果啟用) ===
-    start_serve = (args.serve or args.serve_only) and os.getenv("GITHUB_ACTIONS") != "true"
-
-    # 兼容舊版 WEBUI_HOST/WEBUI_PORT：如果用戶未通過 --host/--port 指定，則使用舊變量
-    if start_serve:
-        if args.host == '0.0.0.0' and os.getenv('WEBUI_HOST'):
-            args.host = os.getenv('WEBUI_HOST')
-        if args.port == 8000 and os.getenv('WEBUI_PORT'):
-            args.port = int(os.getenv('WEBUI_PORT'))
-
-    bot_clients_started = False
-    if start_serve:
-        if not prepare_webui_frontend_assets():
-            logger.warning("前端靜態資源未就緒，繼續啟動 FastAPI 服務（Web 頁面可能不可用）")
-        try:
-            start_api_server(host=args.host, port=args.port, config=config)
-            bot_clients_started = True
         except Exception as e:
-            logger.error(f"啟動 FastAPI 服務失敗: {e}")
+            logger.error(f"[大盤] 獲取指數行情失敗: {e}")
 
-    if bot_clients_started:
-        start_bot_stream_clients(config)
+        return indices
 
-    # === 僅 Web 服務模式：不自動執行分析 ===
-    if args.serve_only:
-        logger.info("模式: 僅 Web 服務")
-        logger.info(f"Web 服務運行中: http://{args.host}:{args.port}")
-        logger.info("通過 /api/v1/analysis/stock/{code} 接口觸發分析")
-        logger.info(f"API 文檔: http://{args.host}:{args.port}/docs")
-        logger.info("按 Ctrl+C 退出...")
+    def _get_market_statistics(self, overview: MarketOverview):
+        """獲取市場漲跌統計"""
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("\n用戶中斷，程序退出")
-        return 0
+            logger.info("[大盤] 獲取市場漲跌統計...")
 
-    try:
-        # 模式0: 回測
-        if getattr(args, 'backtest', False):
-            logger.info("模式: 回測")
-            from src.services.backtest_service import BacktestService
+            stats = self.data_manager.get_market_stats()
 
-            service = BacktestService()
-            stats = service.run_backtest(
-                code=getattr(args, 'backtest_code', None),
-                force=getattr(args, 'backtest_force', False),
-                eval_window_days=getattr(args, 'backtest_days', None),
-            )
-            logger.info(
-                f"回測完成: processed={stats.get('processed')} saved={stats.get('saved')} "
-                f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
-            )
-            return 0
+            if stats:
+                overview.up_count = stats.get('up_count', 0)
+                overview.down_count = stats.get('down_count', 0)
+                overview.flat_count = stats.get('flat_count', 0)
+                overview.limit_up_count = stats.get('limit_up_count', 0)
+                overview.limit_down_count = stats.get('limit_down_count', 0)
+                overview.total_amount = stats.get('total_amount', 0.0)
 
-        # 模式1: 僅大盤復盤
-        if args.market_review:
-            from src.analyzer import GeminiAnalyzer
-            from src.core.market_review import run_market_review
-            from src.notification import NotificationService
-            from src.search_service import SearchService
+                logger.info(f"[大盤] 漲:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
+                          f"漲停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
+                          f"成交額:{overview.total_amount:.0f}億")
 
-            # Issue #373: Trading day check for market-review-only mode.
-            # Do NOT use _compute_trading_day_filter here: that helper checks
-            # config.market_review_enabled, which would wrongly block an
-            # explicit --market-review invocation when the flag is disabled.
-            effective_region = None
-            if not getattr(args, 'force_run', False) and getattr(config, 'trading_day_check_enabled', True):
-                from src.core.trading_calendar import get_open_markets_today, compute_effective_region as _compute_region
-                open_markets = get_open_markets_today()
-                effective_region = _compute_region(
-                    getattr(config, 'market_review_region', 'cn') or 'cn', open_markets
+        except Exception as e:
+            logger.error(f"[大盤] 獲取漲跌統計失敗: {e}")
+
+    def _get_sector_rankings(self, overview: MarketOverview):
+        """獲取板塊漲跌榜"""
+        try:
+            logger.info("[大盤] 獲取板塊漲跌榜...")
+
+            top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5)
+
+            if top_sectors or bottom_sectors:
+                overview.top_sectors = top_sectors
+                overview.bottom_sectors = bottom_sectors
+
+                logger.info(f"[大盤] 領漲板塊: {[s['name'] for s in overview.top_sectors]}")
+                logger.info(f"[大盤] 領跌板塊: {[s['name'] for s in overview.bottom_sectors]}")
+
+        except Exception as e:
+            logger.error(f"[大盤] 獲取板塊漲跌榜失敗: {e}")
+    
+    # def _get_north_flow(self, overview: MarketOverview):
+    #     """獲取北向資金流入"""
+    #     try:
+    #         logger.info("[大盤] 獲取北向資金...")
+    #         
+    #         # 獲取北向資金數據
+    #         df = ak.stock_hsgt_north_net_flow_in_em(symbol="北上")
+    #         
+    #         if df is not None and not df.empty:
+    #             # 取最新一條數據
+    #             latest = df.iloc[-1]
+    #             if '当日净流入' in df.columns:
+    #                 overview.north_flow = float(latest['当日净流入']) / 1e8  # 轉為億元
+    #             elif '净流入' in df.columns:
+    #                 overview.north_flow = float(latest['净流入']) / 1e8
+    #                 
+    #             logger.info(f"[大盤] 北向資金淨流入: {overview.north_flow:.2f}億")
+    #             
+    #     except Exception as e:
+    #         logger.warning(f"[大盤] 獲取北向資金失敗: {e}")
+    
+    def search_market_news(self) -> List[Dict]:
+        """
+        搜索市場新聞
+        
+        Returns:
+            新聞列表
+        """
+        if not self.search_service:
+            logger.warning("[大盤] 搜索服務未配置，跳過新聞搜索")
+            return []
+        
+        all_news = []
+
+        # 按 region 使用不同的新聞搜索詞
+        search_queries = self.profile.news_queries
+        
+        try:
+            logger.info("[大盤] 開始搜索市場新聞...")
+            
+            # 根據 region 設置搜索上下文名稱，避免美股搜索被解讀為 A 股語境
+            market_name = "大盤" if self.region == "cn" else "US market"
+            for query in search_queries:
+                response = self.search_service.search_stock_news(
+                    stock_code="market",
+                    stock_name=market_name,
+                    max_results=3,
+                    focus_keywords=query.split()
                 )
-                if effective_region == '':
-                    logger.info("今日大盤復盤相關市場均為非交易日，跳過執行。可使用 --force-run 強制執行。")
-                    return 0
+                if response and response.results:
+                    all_news.extend(response.results)
+                    logger.info(f"[大盤] 搜索 '{query}' 獲取 {len(response.results)} 條結果")
+            
+            logger.info(f"[大盤] 共獲取 {len(all_news)} 條市場新聞")
+            
+        except Exception as e:
+            logger.error(f"[大盤] 搜索市場新聞失敗: {e}")
+        
+        return all_news
+    
+    def generate_market_review(self, overview: MarketOverview, news: List) -> str:
+        """
+        使用大模型生成大盤復盤報告
+        
+        Args:
+            overview: 市場概覽數據
+            news: 市場新聞列表 (SearchResult 對象列表)
+            
+        Returns:
+            大盤復盤報告文本
+        """
+        if not self.analyzer or not self.analyzer.is_available():
+            logger.warning("[大盤] AI分析器未配置或不可用，使用模板生成報告")
+            return self._generate_template_review(overview, news)
+        
+        # 構建 Prompt
+        prompt = self._build_review_prompt(overview, news)
+        
+        logger.info("[大盤] 調用大模型生成復盤報告...")
+        # Use the public generate_text() entry point — never access private analyzer attributes.
+        review = self.analyzer.generate_text(prompt, max_tokens=2048, temperature=0.7)
 
-            logger.info("模式: 僅大盤復盤")
-            notifier = NotificationService()
-
-            # 初始化搜索服務和分析器（如果有配置）
-            search_service = None
-            analyzer = None
-
-            if config.bocha_api_keys or config.tavily_api_keys or config.brave_api_keys or config.serpapi_keys:
-                search_service = SearchService(
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    news_max_age_days=config.news_max_age_days,
-                )
-
-            if config.gemini_api_key or config.openai_api_key:
-                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
-                if not analyzer.is_available():
-                    logger.warning("AI 分析器初始化後不可用，請檢查 API Key 配置")
-                    analyzer = None
-            else:
-                logger.warning("未檢測到 API Key (Gemini/OpenAI)，將僅使用模板生成報告")
-
-            run_market_review(
-                notifier=notifier,
-                analyzer=analyzer,
-                search_service=search_service,
-                send_notification=not args.no_notify,
-                override_region=effective_region,
-            )
-            return 0
-
-        # 模式2: 定時任務模式
-        if args.schedule or config.schedule_enabled:
-            logger.info("模式: 定時任務")
-            logger.info(f"每日執行時間: {config.schedule_time}")
-
-            # Determine whether to run immediately:
-            # Command line arg --no-run-immediately overrides config if present.
-            # Otherwise use config (defaults to True).
-            should_run_immediately = config.schedule_run_immediately
-            if getattr(args, 'no_run_immediately', False):
-                should_run_immediately = False
-
-            logger.info(f"啟動時立即執行: {should_run_immediately}")
-
-            from src.scheduler import run_with_schedule
-
-            def scheduled_task():
-                run_full_analysis(config, args, stock_codes)
-
-            run_with_schedule(
-                task=scheduled_task,
-                schedule_time=config.schedule_time,
-                run_immediately=should_run_immediately
-            )
-            return 0
-
-        # 模式3: 正常單次運行
-        if config.run_immediately:
-            run_full_analysis(config, args, stock_codes)
+        if review:
+            logger.info("[大盤] 復盤報告生成成功，長度: %d 字元", len(review))
+            # Inject structured data tables into LLM prose sections
+            return self._inject_data_into_review(review, overview)
         else:
-            logger.info("配置為不立即運行分析 (RUN_IMMEDIATELY=false)")
+            logger.warning("[大盤] 大模型返回為空，使用模板報告")
+            return self._generate_template_review(overview, news)
+    
+    def _inject_data_into_review(self, review: str, overview: MarketOverview) -> str:
+        """Inject structured data tables into the corresponding LLM prose sections."""
+        import re
 
-        logger.info("\n程序執行完成")
+        # Build data blocks
+        stats_block = self._build_stats_block(overview)
+        indices_block = self._build_indices_block(overview)
+        sector_block = self._build_sector_block(overview)
 
-        # 如果啟用了服務且是非定時任務模式，保持程序運行
-        keep_running = start_serve and not (args.schedule or config.schedule_enabled)
-        if keep_running:
-            logger.info("API 服務運行中 (按 Ctrl+C 退出)...")
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
+        # Inject market stats after "### 一、市場總結" section (before next ###)
+        if stats_block:
+            review = self._insert_after_section(review, r'###\s*一、市場總結', stats_block)
 
-        return 0
+        # Inject indices table after "### 二、指數點評" section
+        if indices_block:
+            review = self._insert_after_section(review, r'###\s*二、指數點評', indices_block)
 
-    except KeyboardInterrupt:
-        logger.info("\n用戶中斷，程序退出")
-        return 130
+        # Inject sector rankings after "### 四、熱點解讀" section
+        if sector_block:
+            review = self._insert_after_section(review, r'###\s*四、熱點解讀', sector_block)
 
-    except Exception as e:
-        logger.exception(f"程序執行失敗: {e}")
-        return 1
+        return review
+
+    @staticmethod
+    def _insert_after_section(text: str, heading_pattern: str, block: str) -> str:
+        """Insert a data block at the end of a markdown section (before the next ### heading)."""
+        import re
+        # Find the heading
+        match = re.search(heading_pattern, text)
+        if not match:
+            return text
+        start = match.end()
+        # Find the next ### heading after this one
+        next_heading = re.search(r'\n###\s', text[start:])
+        if next_heading:
+            insert_pos = start + next_heading.start()
+        else:
+            # No next heading — append at end
+            insert_pos = len(text)
+        # Insert the block before the next heading, with spacing
+        return text[:insert_pos].rstrip() + '\n\n' + block + '\n\n' + text[insert_pos:].lstrip('\n')
+
+    def _build_stats_block(self, overview: MarketOverview) -> str:
+        """Build market statistics block."""
+        has_stats = overview.up_count or overview.down_count or overview.total_amount
+        if not has_stats:
+            return ""
+        lines = [
+            f"> 📈 上漲 **{overview.up_count}** 家 / 下跌 **{overview.down_count}** 家 / "
+            f"平盤 **{overview.flat_count}** 家 | "
+            f"漲停 **{overview.limit_up_count}** / 跌停 **{overview.limit_down_count}** | "
+            f"成交額 **{overview.total_amount:.0f}** 億"
+        ]
+        return "\n".join(lines)
+
+    def _build_indices_block(self, overview: MarketOverview) -> str:
+        """構建指數行情表格（不含振幅）"""
+        if not overview.indices:
+            return ""
+        lines = [
+            "| 指數 | 最新 | 漲跌幅 | 成交額(億) |",
+            "|------|------|--------|-----------|"]
+        for idx in overview.indices:
+            arrow = "🔴" if idx.change_pct < 0 else "🟢" if idx.change_pct > 0 else "⚪"
+            amount_raw = idx.amount or 0.0
+            if amount_raw == 0.0:
+                # Yahoo Finance 不提供成交額，顯示 N/A 避免誤解
+                amount_str = "N/A"
+            elif amount_raw > 1e6:
+                amount_str = f"{amount_raw / 1e8:.0f}"
+            else:
+                amount_str = f"{amount_raw:.0f}"
+            lines.append(f"| {idx.name} | {idx.current:.2f} | {arrow} {idx.change_pct:+.2f}% | {amount_str} |")
+        return "\n".join(lines)
+
+    def _build_sector_block(self, overview: MarketOverview) -> str:
+        """Build sector ranking block."""
+        if not overview.top_sectors and not overview.bottom_sectors:
+            return ""
+        lines = []
+        if overview.top_sectors:
+            top = " | ".join(
+                [f"**{s['name']}**({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:5]]
+            )
+            lines.append(f"> 🔥 領漲: {top}")
+        if overview.bottom_sectors:
+            bot = " | ".join(
+                [f"**{s['name']}**({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:5]]
+            )
+            lines.append(f"> 💧 領跌: {bot}")
+        return "\n".join(lines)
+
+    def _build_review_prompt(self, overview: MarketOverview, news: List) -> str:
+        """構建復盤報告 Prompt"""
+        # 指數行情信息（簡潔格式，不用emoji）
+        indices_text = ""
+        for idx in overview.indices:
+            direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
+            indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
+        
+        # 板塊信息
+        top_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:3]])
+        bottom_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:3]])
+        
+        # 新聞信息 - 支持 SearchResult 對象或字典
+        news_text = ""
+        for i, n in enumerate(news[:6], 1):
+            # 兼容 SearchResult 對象和字典
+            if hasattr(n, 'title'):
+                title = n.title[:50] if n.title else ''
+                snippet = n.snippet[:100] if n.snippet else ''
+            else:
+                title = n.get('title', '')[:50]
+                snippet = n.get('snippet', '')[:100]
+            news_text += f"{i}. {title}\n   {snippet}\n"
+        
+        # 按 region 組裝市場概況與板塊區塊（美股無漲跌家數、板塊數據）
+        stats_block = ""
+        sector_block = ""
+        if self.region == "us":
+            if self.profile.has_market_stats:
+                stats_block = f"""## Market Overview
+- Up: {overview.up_count} | Down: {overview.down_count} | Flat: {overview.flat_count}
+- Limit up: {overview.limit_up_count} | Limit down: {overview.limit_down_count}
+- Total volume (CNY bn): {overview.total_amount:.0f}"""
+            else:
+                stats_block = "## Market Overview\n(US market has no equivalent advance/decline stats.)"
+
+            if self.profile.has_sector_rankings:
+                sector_block = f"""## Sector Performance
+Leading: {top_sectors_text if top_sectors_text else "N/A"}
+Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
+            else:
+                sector_block = "## Sector Performance\n(US sector data not available.)"
+        else:
+            if self.profile.has_market_stats:
+                stats_block = f"""## 市場概況
+- 上漲: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盤: {overview.flat_count} 家
+- 漲停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
+- 兩市成交額: {overview.total_amount:.0f} 億元"""
+            else:
+                stats_block = "## 市場概況\n（美股暫無漲跌家數等統計）"
+
+            if self.profile.has_sector_rankings:
+                sector_block = f"""## 板塊表現
+領漲: {top_sectors_text if top_sectors_text else "暫無數據"}
+領跌: {bottom_sectors_text if bottom_sectors_text else "暫無數據"}"""
+            else:
+                sector_block = "## 板塊表現\n（美股暫無板塊漲跌數據）"
+
+        data_no_indices_hint = (
+            "注意：由於行情數據獲取失敗，請主要根據【市場新聞】進行定性分析和總結，不要編造具體的指數點位。"
+            if not indices_text
+            else ""
+        )
+        indices_placeholder = indices_text if indices_text else ("No index data (API error)" if self.region == "us" else "暫無指數數據（接口異常）")
+        news_placeholder = news_text if news_text else ("No relevant news" if self.region == "us" else "暫無相關新聞")
+
+        # 美股場景使用英文提示語，便於生成更符合美股語境的報告
+        if self.region == "us":
+            data_no_indices_hint_en = (
+                "Note: Market data fetch failed. Rely mainly on [Market News] for qualitative analysis. Do not invent index levels."
+                if not indices_text
+                else ""
+            )
+            return f"""You are a professional US/A/H market analyst. Please produce a concise US market recap report based on the data below.
+
+[Requirements]
+- Output pure Markdown only
+- No JSON
+- No code blocks
+- Use emoji sparingly in headings (at most one per heading)
+
+---
+
+# Today's Market Data
+
+## Date
+{overview.date}
+
+## Major Indices
+{indices_placeholder}
+
+{stats_block}
+
+{sector_block}
+
+## Market News
+{news_placeholder}
+
+{data_no_indices_hint_en}
+
+{self.strategy.to_prompt_block()}
+
+---
+
+# Output Template (follow this structure)
+
+## {overview.date} US Market Recap
+
+### 1. Market Summary
+(2-3 sentences on overall market performance, index moves, volume)
+
+### 2. Index Commentary
+(Analyse S&P 500, Nasdaq, Dow and other major index moves.)
+
+### 3. Fund Flows
+(Interpret volume and flow implications)
+
+### 4. Sector/Theme Highlights
+(Analyze drivers behind leading/lagging sectors)
+
+### 5. Outlook
+(Short-term view based on price action and news)
+
+### 6. Risk Alerts
+(Key risks to watch)
+
+### 7. Strategy Plan
+(Provide risk-on/neutral/risk-off stance, position sizing guideline, and one invalidation trigger.)
+
+---
+
+Output the report content directly, no extra commentary.
+"""
+
+        # A 股場景使用中文提示語
+        return f"""你是一位專業的A/H/美股市場分析師，請根據以下數據生成一份簡潔的大盤復盤報告。
+
+【重要】輸出要求：
+- 必須輸出純 Markdown 文本格式
+- 禁止輸出 JSON 格式
+- 禁止輸出代碼塊
+- emoji 僅在標題處少量使用（每個標題最多1個）
+
+---
+
+# 今日市場數據
+
+## 日期
+{overview.date}
+
+## 主要指數
+{indices_placeholder}
+
+{stats_block}
+
+{sector_block}
+
+## 市場新聞
+{news_placeholder}
+
+{data_no_indices_hint}
+
+{self.strategy.to_prompt_block()}
+
+---
+
+# 輸出格式模板（請嚴格按此格式輸出）
+
+## {overview.date} 大盤復盤
+
+### 一、市場總結
+（2-3句話概括今日市場整體表現，包括指數漲跌、成交量變化）
+
+### 二、指數點評
+（{self.profile.prompt_index_hint}）
+
+### 三、資金動向
+（解讀成交額流向的含義）
+
+### 四、熱點解讀
+（分析領漲領跌板塊背後的邏輯和驅動因素）
+
+### 五、後市展望
+（結合當前走勢和新聞，給出明日市場預判）
+
+### 六、風險提示
+（需要關注的風險點）
+
+### 七、策略計劃
+（給出進攻/均衡/防守結論，對應倉位建議，並給出一個觸發失效條件；最後補充“建議僅供參考，不構成投資建議”。）
+
+---
+
+請直接輸出復盤報告內容，不要輸出其他說明文字。
+"""
+    
+    def _generate_template_review(self, overview: MarketOverview, news: List) -> str:
+        """使用模板生成復盤報告（無大模型時的備選方案）"""
+        mood_code = self.profile.mood_index_code
+        # 根據 mood_index_code 查找對應指數
+        # cn: mood_code="000001"，idx.code 可能為 "sh000001"（以 mood_code 結尾）
+        # us: mood_code="SPX"，idx.code 直接為 "SPX"
+        mood_index = next(
+            (
+                idx
+                for idx in overview.indices
+                if idx.code == mood_code or idx.code.endswith(mood_code)
+            ),
+            None,
+        )
+        if mood_index:
+            if mood_index.change_pct > 1:
+                market_mood = "強勢上漲"
+            elif mood_index.change_pct > 0:
+                market_mood = "小幅上漲"
+            elif mood_index.change_pct > -1:
+                market_mood = "小幅下跌"
+            else:
+                market_mood = "明顯下跌"
+        else:
+            market_mood = "震盪整理"
+        
+        # 指數行情（簡潔格式）
+        indices_text = ""
+        for idx in overview.indices[:4]:
+            direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
+            indices_text += f"- **{idx.name}**: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
+        
+        # 板塊信息
+        top_text = "、".join([s['name'] for s in overview.top_sectors[:3]])
+        bottom_text = "、".join([s['name'] for s in overview.bottom_sectors[:3]])
+        
+        # 按 region 決定是否包含漲跌統計和板塊（美股無）
+        stats_section = ""
+        if self.profile.has_market_stats:
+            stats_section = f"""
+### 三、漲跌統計
+| 指標 | 數值 |
+|------|------|
+| 上漲家數 | {overview.up_count} |
+| 下跌家數 | {overview.down_count} |
+| 漲停 | {overview.limit_up_count} |
+| 跌停 | {overview.limit_down_count} |
+| 兩市成交額 | {overview.total_amount:.0f}億 |
+"""
+        sector_section = ""
+        if self.profile.has_sector_rankings and (top_text or bottom_text):
+            sector_section = f"""
+### 四、板塊表現
+- **領漲**: {top_text}
+- **領跌**: {bottom_text}
+"""
+        market_label = "A股" if self.region == "cn" else "美股"
+        strategy_summary = self.strategy.to_markdown_block()
+        report = f"""## {overview.date} 大盤復盤
+
+### 一、市場總結
+今日{market_label}市場整體呈現**{market_mood}**態勢。
+
+### 二、主要指數
+{indices_text}
+{stats_section}
+{sector_section}
+### 五、風險提示
+市場有風險，投資需謹慎。以上數據僅供參考，不構成投資建議。
+
+{strategy_summary}
+
+---
+*復盤時間: {datetime.now().strftime('%H:%M')}*
+"""
+        return report
+    
+    def run_daily_review(self) -> str:
+        """
+        執行每日大盤復盤流程
+        
+        Returns:
+            復盤報告文本
+        """
+        logger.info("========== 開始大盤復盤分析 ==========")
+        
+        # 1. 獲取市場概覽
+        overview = self.get_market_overview()
+        
+        # 2. 搜索市場新聞
+        news = self.search_market_news()
+        
+        # 3. 生成復盤報告
+        report = self.generate_market_review(overview, news)
+        
+        logger.info("========== 大盤復盤分析完成 ==========")
+        
+        return report
 
 
+# 測試入口
 if __name__ == "__main__":
-    sys.exit(main())
+    import sys
+    sys.path.insert(0, '.')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
+    )
+    
+    analyzer = MarketAnalyzer()
+    
+    # 測試獲取市場概覽
+    overview = analyzer.get_market_overview()
+    print(f"\n=== 市場概覽 ===")
+    print(f"日期: {overview.date}")
+    print(f"指數數量: {len(overview.indices)}")
+    for idx in overview.indices:
+        print(f"  {idx.name}: {idx.current:.2f} ({idx.change_pct:+.2f}%)")
+    print(f"上漲: {overview.up_count} | 下跌: {overview.down_count}")
+    print(f"成交額: {overview.total_amount:.0f}億")
+    
+    # 測試生成模板報告
+    report = analyzer._generate_template_review(overview, [])
+    print(f"\n=== 復盤報告 ===")
+    print(report)
