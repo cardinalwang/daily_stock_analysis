@@ -91,7 +91,7 @@ def run_market_review(
             date_str = datetime.now().strftime('%Y%m%d')
             report_filename = f"market_review_{date_str}.md"
             filepath = notifier.save_report_to_file(
-                f"# □□□□□n\n{review_report}", 
+                f"# 大盤復盤\n\n{review_report}", 
                 report_filename
             )
             logger.info(f"大盤復盤報告已保存: {filepath}")
@@ -101,7 +101,7 @@ def run_market_review(
                 logger.info("合併推送模式：跳過大盤復盤單獨推送，將在個股+大盤復盤後統一發送")
             elif send_notification and notifier.is_available():
                 # 添加標題
-                report_content = f"□□□□□n\n{review_report}"
+                report_content = f"# 大盤復盤\n\n{review_report}"
 
                 success = notifier.send(report_content, email_send_to_all=True)
                 if success:
